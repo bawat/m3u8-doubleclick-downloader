@@ -1,1 +1,5 @@
-node_modules/ 
+node_modules/
+
+# Downloaded media and playlists (user content, not part of the tool)
+*.mp4
+*.m3u8
