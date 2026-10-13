@@ -20,10 +20,19 @@ import os from "os";
 // ---------------------------------------------------------------------------
 // M3U8 -> MP4 downloader with automatic IPv6 fallback (Cloudflare WARP).
 //
-// Handles playlists whose segment URLs mix absolute CDN URLs with relative
-// origin URLs: relative segments are rebuilt from the absolute CDN template by
-// their index. Each segment is fetched with retries; failures are reported,
-// not fatal. Segments are concatenated and remuxed to MP4 with ffmpeg.
+// Takes a local .m3u8, a .url internet shortcut to one, or a playlist URL.
+// Relative segment paths resolve against the playlist's URL; for a local file
+// that is the source URL the browser recorded in its Zone.Identifier stream.
+// Playlists whose segment URLs mix absolute CDN URLs with relative origin URLs
+// work even without it: relative segments are rebuilt from the absolute CDN
+// template by their index.
+//
+// Handles MPEG-TS and fMP4/CMAF playlists, including #EXT-X-MAP init sections
+// and #EXT-X-BYTERANGE segments that are slices of a single file. Each segment
+// is fetched with retries; failures are reported, not fatal. Segments are
+// joined and remuxed to MP4 with ffmpeg. (Remuxing the joined file avoids
+// ffmpeg's HLS reader, which shifts audio out of sync when fMP4 segments are
+// longer than 10 s.)
 //
 // Some CDNs (e.g. *.ahcdn.com) are reachable ONLY over IPv6. If this machine
 // has no IPv6 route, the tool transparently spins up a userspace Cloudflare
@@ -48,68 +57,128 @@ const TOOLS_DIR = path.join(process.env.LOCALAPPDATA || os.homedir(), "m3u8dl");
 
 // --- args -------------------------------------------------------------------
 const argv = process.argv.slice(2);
-let file = null;
+let input = null;
 let socksOverride = null;
 let allowWarp = true;
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === "--no-warp") allowWarp = false;
   else if (a === "--socks") socksOverride = argv[++i];
-  else if (!a.startsWith("--")) file = a;
+  else if (!a.startsWith("--")) input = a;
 }
-if (!file) {
-  console.error("Usage: node fix_m3u8.mjs <file.m3u8> [--socks host:port] [--no-warp]");
+if (!input) {
+  console.error(
+    "Usage: node fix_m3u8.mjs <file.m3u8 | shortcut.url | playlist URL> [--socks host:port] [--no-warp]"
+  );
   process.exit(1);
+}
+
+// --- input ------------------------------------------------------------------
+const isAbsolute = (u) => /^https?:\/\//i.test(u);
+
+let playlistUrl = null; // relative segment paths resolve against this
+let localText = null; // contents of a local .m3u8; otherwise fetched from playlistUrl
+if (isAbsolute(input)) {
+  playlistUrl = input;
+} else if (/\.url$/i.test(input)) {
+  playlistUrl = (readFileSync(input, "utf8").match(/^URL=(https?:\/\/.+)$/im) || [])[1];
+  if (!playlistUrl) {
+    console.error(`No http(s) URL found in shortcut: ${input}`);
+    process.exit(1);
+  }
+  playlistUrl = playlistUrl.trim();
+} else {
+  localText = readFileSync(input, "utf8");
+  try {
+    const zone = readFileSync(input + ":Zone.Identifier", "utf8");
+    playlistUrl = (zone.match(/^HostUrl=(https?:\/\/\S+)/im) || [])[1] || null;
+  } catch {}
 }
 
 // ---------------------------------------------------------------------------
 // Parse playlist
 // ---------------------------------------------------------------------------
-const content = readFileSync(file, "utf8");
-const rawSegs = content
-  .split(/\r?\n/)
-  .map((l) => l.trim())
-  .filter((l) => l && !l.startsWith("#"));
-if (rawSegs.length === 0) {
-  console.error("No segment URLs found in the playlist.");
-  process.exit(1);
+
+// Value of `name` in an attribute list such as: URI="init.mp4",BYTERANGE="720@0"
+function attr(list, name) {
+  const m = list.match(new RegExp(`(?:^|,)\\s*${name}=("[^"]*"|[^,]*)`, "i"));
+  return m ? m[1].replace(/^"|"$/g, "") : null;
 }
 
-const firstAbsolute = rawSegs.find((u) => /^https?:\/\//i.test(u));
-if (!firstAbsolute) {
-  console.error("Could not find any absolute URL in the m3u8 to derive a base from.");
-  process.exit(1);
+// "<length>[@<offset>]" -> inclusive { start, end }. Without an offset the
+// range starts at `nextOffset`.
+function parseByteRange(spec, nextOffset) {
+  const [len, off] = spec.split("@");
+  const start = off === undefined ? nextOffset : Number(off);
+  return { start, end: start + Number(len) - 1 };
 }
-const base = firstAbsolute.match(/^(https?:\/\/[^/]+)/i)[1];
-const baseHost = new URL(base).hostname;
+
+// -> [{ uri, range, map }] in playback order, where `map` is the #EXT-X-MAP
+// init section ({ uri, range }) that applies to the segment, if any.
+function parsePlaylist(text) {
+  const segs = [];
+  const nextOffset = new Map(); // uri -> first byte after its previous range
+  let map = null;
+  let rangeSpec = null;
+  for (const line of text.split(/\r?\n/).map((l) => l.trim())) {
+    if (!line) continue;
+    const tag = line.match(/^#(EXT-X-MAP|EXT-X-BYTERANGE):(.*)$/i);
+    if (tag && tag[1].toUpperCase() === "EXT-X-MAP") {
+      const br = attr(tag[2], "BYTERANGE");
+      map = { uri: attr(tag[2], "URI"), range: br ? parseByteRange(br, 0) : null };
+    } else if (tag) {
+      rangeSpec = tag[2].trim();
+    }
+    if (line.startsWith("#")) continue;
+    let range = null;
+    if (rangeSpec) {
+      range = parseByteRange(rangeSpec, nextOffset.get(line) ?? 0);
+      nextOffset.set(line, range.end + 1);
+      rangeSpec = null;
+    }
+    segs.push({ uri: line, range, map });
+  }
+  return segs;
+}
 
 const SEG_RE = /seg-(\d+)(-v\d+-a\d+\.ts)$/i;
-let template = null;
-const tmatch = firstAbsolute.match(SEG_RE);
-if (tmatch) {
-  template = {
-    prefix: firstAbsolute.slice(0, tmatch.index) + "seg-",
-    suffix: tmatch[2],
-  };
-}
 const segIndex = (u) => (u.match(SEG_RE) || [])[1] || null;
 
-const segments = rawSegs.map((u) => {
-  const idx = segIndex(u);
-  const candidates = [];
-  if (/^https?:\/\//i.test(u)) candidates.push(u);
-  else {
-    if (template && idx) candidates.push(template.prefix + idx + template.suffix);
-    candidates.push(base + (u.startsWith("/") ? u : "/" + u));
-  }
-  if (template && idx) {
-    const t = template.prefix + idx + template.suffix;
-    if (!candidates.includes(t)) candidates.push(t);
-  }
-  return { idx, candidates };
-});
+// Turns segments into download jobs in file order (an init section goes right
+// before the first segment that uses it), each with candidate URLs, best first.
+function planJobs(segs) {
+  const firstAbsolute = segs.map((s) => s.uri).find(isAbsolute);
+  const base = firstAbsolute ? firstAbsolute.match(/^(https?:\/\/[^/]+)/i)[1] : null;
+  const tmatch = firstAbsolute && firstAbsolute.match(SEG_RE);
+  const template = tmatch
+    ? { prefix: firstAbsolute.slice(0, tmatch.index) + "seg-", suffix: tmatch[2] }
+    : null;
 
-const relCount = rawSegs.filter((u) => !/^https?:\/\//i.test(u)).length;
+  const candidatesFor = (u) => {
+    const idx = segIndex(u);
+    const fromTemplate = template && idx ? template.prefix + idx + template.suffix : null;
+    const list = [];
+    if (isAbsolute(u)) list.push(u);
+    else {
+      if (playlistUrl) list.push(new URL(u, playlistUrl).href);
+      if (fromTemplate) list.push(fromTemplate);
+      if (base) list.push(base + (u.startsWith("/") ? u : "/" + u));
+    }
+    if (fromTemplate) list.push(fromTemplate);
+    return [...new Set(list)];
+  };
+
+  const jobs = [];
+  let lastMapKey = null;
+  segs.forEach((s, n) => {
+    const mapKey = s.map && `${s.map.uri}|${s.map.range?.start}`;
+    if (mapKey && mapKey !== lastMapKey)
+      jobs.push({ isInit: true, candidates: candidatesFor(s.map.uri), range: s.map.range });
+    lastMapKey = mapKey;
+    jobs.push({ num: segIndex(s.uri) ?? n, candidates: candidatesFor(s.uri), range: s.range });
+  });
+  return { jobs, base };
+}
 
 // ---------------------------------------------------------------------------
 // SOCKS5 plumbing (used when routing through the WARP tunnel)
@@ -226,26 +295,40 @@ let proxyObj = null;
 const makeAgent = (connectTimeout) =>
   new SocksHttpsAgent(proxyObj, { keepAlive: true, maxSockets: CONCURRENCY, connectTimeout });
 
-function fetchBuffer(url, redirectsLeft = 5, timeoutMs = 30000) {
+// `range` ({ start, end }, inclusive) fetches just that slice of the file.
+function fetchBuffer(url, redirectsLeft = 5, timeoutMs = 30000, range = null) {
   return new Promise((resolve, reject) => {
     const isHttps = url.startsWith("https");
     const mod = isHttps ? https : http;
-    const opts = { headers: { "User-Agent": UA, Accept: "*/*" }, timeout: timeoutMs };
+    const reqHeaders = { "User-Agent": UA, Accept: "*/*" };
+    if (range) reqHeaders.Range = `bytes=${range.start}-${range.end}`;
+    const opts = { headers: reqHeaders, timeout: timeoutMs };
     if (isHttps && httpsAgent) opts.agent = httpsAgent;
     const req = mod.get(url, opts, (res) => {
       const { statusCode, headers } = res;
       if (statusCode >= 300 && statusCode < 400 && headers.location) {
         res.resume();
         if (redirectsLeft <= 0) return reject(new Error("too many redirects"));
-        return resolve(fetchBuffer(new URL(headers.location, url).toString(), redirectsLeft - 1, timeoutMs));
+        return resolve(
+          fetchBuffer(new URL(headers.location, url).toString(), redirectsLeft - 1, timeoutMs, range)
+        );
       }
-      if (statusCode !== 200) {
+      if (statusCode !== 200 && !(range && statusCode === 206)) {
         res.resume();
         return reject(new Error(`HTTP ${statusCode}`));
       }
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
-      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", reject);
+      res.on("end", () => {
+        const buf = Buffer.concat(chunks);
+        const want = range && range.end - range.start + 1;
+        if (range && buf.length !== want)
+          return reject(
+            new Error(statusCode === 206 ? `got ${buf.length} of ${want} bytes` : "server ignored the byte range")
+          );
+        resolve(buf);
+      });
     });
     req.on("timeout", () => req.destroy(new Error("timeout")));
     req.on("error", reject);
@@ -257,7 +340,7 @@ async function downloadSegment(seg) {
   for (const url of seg.candidates) {
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        const buf = await fetchBuffer(url);
+        const buf = await fetchBuffer(url, 5, 30000, seg.range);
         if (buf.length === 0) throw new Error("empty body");
         return buf;
       } catch (e) {
@@ -280,7 +363,7 @@ async function runPool(items, worker, concurrency) {
     results[i] = await worker(items[i], i);
     done++;
     if (done % 10 === 0 || done === items.length)
-      process.stdout.write(`\r  downloaded ${done}/${items.length} segments   `);
+      process.stdout.write(`\r  downloaded ${done}/${items.length}   `);
     return spawnWorker();
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, spawnWorker));
@@ -291,13 +374,31 @@ async function runPool(items, worker, concurrency) {
 // ---------------------------------------------------------------------------
 // Connectivity probe + WARP tunnel bring-up
 // ---------------------------------------------------------------------------
-async function canReachDirect() {
+const directHosts = new Set();
+
+// Makes sure `url`'s host can be reached: runs `probe` directly, and if that
+// fails brings up the WARP tunnel, which all later requests then go through.
+// Returns the probe's result if it succeeded directly, otherwise null.
+async function ensureReachable(url, probe) {
+  const host = new URL(url).hostname;
+  if (proxyObj || directHosts.has(host)) return null;
+  const a = await dns.resolve4(host).catch(() => []);
+  const aaaa = await dns.resolve6(host).catch(() => []);
+  console.log(`Host ${host}: IPv4=${a.length ? a.join(",") : "none"}  IPv6=${aaaa.length ? aaaa.join(",") : "none"}`);
+  process.stdout.write("Checking direct connectivity... ");
   try {
-    await fetchBuffer(segments[0].candidates[0]);
-    return true;
+    const result = await probe();
+    console.log("OK");
+    directHosts.add(host);
+    return result;
   } catch {
-    return false;
+    console.log("unreachable");
   }
+  if (!allowWarp) fail("\nCDN unreachable directly and --no-warp set. Aborting.");
+  console.log("Bringing up IPv6 via userspace Cloudflare WARP (no admin needed):");
+  warpChild = await startWarp();
+  console.log("  tunnel ready.");
+  return null;
 }
 
 function dlToFile(url, dest) {
@@ -416,63 +517,99 @@ async function startWarp() {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-const outName = path.basename(file).replace(/\.m3u8$/i, "");
-const finalOut = /\.mp4$/i.test(outName) ? outName : outName + ".mp4";
-const tmpDir = path.join(os.tmpdir(), `m3u8dl_${path.basename(file)}_${process.pid}`);
+
+// The MP4 is named after the playlist and saved next to the input file (or in
+// the current directory when given a URL).
+function urlFileName(u) {
+  let name = new URL(u).pathname.split("/").pop() || "video";
+  try { name = decodeURIComponent(name); } catch {}
+  return name.replace(/[<>:"/\\|?*]/g, "_");
+}
+const stem = (localText === null ? urlFileName(playlistUrl) : path.basename(input)).replace(/\.m3u8$/i, "");
+const outDir = isAbsolute(input) ? process.cwd() : path.dirname(path.resolve(input));
+const finalOut = path.join(outDir, /\.mp4$/i.test(stem) ? stem : stem + ".mp4");
+const tmpDir = path.join(os.tmpdir(), `m3u8dl_${stem}_${process.pid}`);
 
 let warpChild = null;
 const cleanup = () => {
   try { if (warpChild) warpChild.kill(); } catch {}
   try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
 };
+const fail = (...lines) => {
+  for (const line of lines) console.error(line);
+  cleanup();
+  process.exit(1);
+};
 
 (async () => {
-  console.log(`Playlist: ${file}`);
-  console.log(`Segments: ${segments.length}  (relative rebuilt from template: ${relCount})`);
-  console.log(`Base URL: ${base}`);
+  console.log(`Playlist: ${localText === null ? playlistUrl : input}`);
+  if (localText !== null && playlistUrl) console.log(`Source:   ${playlistUrl}`);
 
-  // Decide how to reach the CDN.
   if (socksOverride) {
     const [h, p] = socksOverride.split(":");
     proxyObj = { host: h, port: Number(p) };
     httpsAgent = makeAgent(30000);
     console.log(`Using SOCKS proxy ${socksOverride}`);
-  } else {
-    const a = await dns.resolve4(baseHost).catch(() => []);
-    const aaaa = await dns.resolve6(baseHost).catch(() => []);
-    console.log(`Host ${baseHost}: IPv4=${a.length ? a.join(",") : "none"}  IPv6=${aaaa.length ? aaaa.join(",") : "none"}`);
-    process.stdout.write("Checking direct connectivity... ");
-    const direct = await canReachDirect();
-    console.log(direct ? "OK" : "unreachable");
-    if (!direct) {
-      if (!allowWarp) {
-        console.error("\nCDN unreachable directly and --no-warp set. Aborting.");
-        process.exit(1);
-      }
-      console.log("Bringing up IPv6 via userspace Cloudflare WARP (no admin needed):");
-      warpChild = await startWarp();
-      console.log("  tunnel ready.");
-    }
   }
+
+  let text = localText;
+  if (text === null) {
+    const buf =
+      (await ensureReachable(playlistUrl, () => fetchBuffer(playlistUrl))) ||
+      (await fetchBuffer(playlistUrl));
+    text = buf.toString("utf8");
+    if (!/^\s*#EXTM3U/.test(text)) fail(`\nNot an M3U8 playlist: ${playlistUrl}`);
+  }
+
+  if (/^#EXT-X-STREAM-INF/im.test(text)) {
+    const variants = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+    fail(
+      "\nThis is a master playlist (a list of quality variants), not a video playlist.",
+      "Convert one of its variants instead:",
+      ...variants.map((v) => "  " + (playlistUrl ? new URL(v, playlistUrl).href : v))
+    );
+  }
+
+  const segs = parsePlaylist(text);
+  if (segs.length === 0) fail("No segment URLs found in the playlist.");
+  const { jobs, base } = planJobs(segs);
+  const relCount = segs.filter((s) => !isAbsolute(s.uri)).length;
+  if (relCount && !base && !playlistUrl)
+    fail(
+      "\nThe playlist's segment paths are relative, and the URL it came from is unknown.",
+      "Right-click an internet shortcut (.url) to the playlist instead, or run:",
+      '  node fix_m3u8.mjs "<playlist URL>"'
+    );
+  const isFmp4 = jobs.some((j) => j.isInit);
+  const ranged = segs.some((s) => s.range) ? ", byte ranges" : "";
+  console.log(`Segments: ${segs.length}  (${isFmp4 ? "fMP4" : "MPEG-TS"}${ranged}; relative paths: ${relCount})`);
+  if (base) console.log(`Base URL: ${base}`);
+
+  // Decide how to reach the segment host.
+  const first = jobs[0];
+  await ensureReachable(first.candidates[0], () =>
+    fetchBuffer(first.candidates[0], 5, 30000, first.range)
+  );
 
   mkdirSync(tmpDir, { recursive: true });
   console.log("Downloading segments...");
   const failures = [];
   const buffers = await runPool(
-    segments,
-    async (seg, i) => {
+    jobs,
+    async (job) => {
       try {
-        return await downloadSegment(seg);
+        return await downloadSegment(job);
       } catch (e) {
-        failures.push({ i, idx: seg.idx, err: e.message });
+        failures.push({ job, err: e.message });
         return null;
       }
     },
     CONCURRENCY
   );
 
-  const ok = buffers.filter(Boolean).length;
-  console.log(`Segments downloaded: ${ok}/${segments.length}`);
+  const segFailures = failures.filter((f) => !f.job.isInit);
+  const ok = segs.length - segFailures.length;
+  console.log(`Segments downloaded: ${ok}/${segs.length}`);
   if (ok === 0) {
     console.error("\nAll segments failed to download.");
     if (failures[0] && /HTTP 40[13]/.test(failures[0].err)) {
@@ -488,29 +625,30 @@ const cleanup = () => {
     cleanup();
     process.exit(1);
   }
-  if (failures.length) {
-    console.warn(`WARNING: ${failures.length} segment(s) failed and will be skipped:`);
-    for (const f of failures.slice(0, 8)) console.warn(`  seg #${f.idx ?? f.i} -> ${f.err}`);
-    if (failures.length > 8) console.warn(`  ...and ${failures.length - 8} more`);
+  const initFailure = failures.find((f) => f.job.isInit);
+  if (initFailure) fail(`\nCould not download the fMP4 init section: ${initFailure.err}`);
+  if (segFailures.length) {
+    console.warn(`WARNING: ${segFailures.length} segment(s) failed and will be skipped:`);
+    for (const f of segFailures.slice(0, 8)) console.warn(`  seg #${f.job.num} -> ${f.err}`);
+    if (segFailures.length > 8) console.warn(`  ...and ${segFailures.length - 8} more`);
   }
 
-  const concatTs = path.join(tmpDir, "all.ts");
-  const out = createWriteStream(concatTs);
+  const joined = path.join(tmpDir, isFmp4 ? "all.mp4" : "all.ts");
+  const out = createWriteStream(joined);
   for (const buf of buffers) if (buf) out.write(buf);
   await new Promise((r) => out.end(r));
 
   console.log(`Remuxing to ${finalOut} ...`);
-  const result = spawnSync(
-    "ffmpeg",
-    ["-y", "-i", concatTs, "-c", "copy", "-bsf:a", "aac_adtstoasc", finalOut],
-    { stdio: "inherit" }
-  );
+  const remuxArgs = isFmp4 ? ["-movflags", "+faststart"] : ["-bsf:a", "aac_adtstoasc"];
+  const result = spawnSync("ffmpeg", ["-y", "-i", joined, "-c", "copy", ...remuxArgs, finalOut], {
+    stdio: "inherit",
+  });
 
   cleanup();
   if (result.status === 0) {
     console.log(`\nDone! Saved as: ${finalOut}`);
-    if (failures.length)
-      console.log(`(Note: ${failures.length} segment(s) missing — video may have small gaps.)`);
+    if (segFailures.length)
+      console.log(`(Note: ${segFailures.length} segment(s) missing — video may have small gaps.)`);
   } else {
     console.error("\nffmpeg failed. See output above.");
     process.exit(1);
